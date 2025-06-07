@@ -1,6 +1,6 @@
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
-from typing import Optional, List
+from typing import Optional, List, Union, Dict, Any
 import torch
 from PIL import Image
 import base64
@@ -52,6 +52,9 @@ class VLLM:
         except:
             self.processor = None
 
+        # Get tokenizer for text-only processing
+        self.tokenizer = self.llm.get_tokenizer()
+
     def _encode_image(self, image_path: str) -> str:
         """Encode image to base64 string"""
         with Image.open(image_path) as img:
@@ -77,30 +80,51 @@ class VLLM:
 
         return {
             "text": text,
-            "images": images
+            "images": images,
+            "is_multimodal": bool(images)  # 明确标记是否为多模态输入
         }
 
-    def _create_prompt(self, input_data: dict, system_prompt: str, enable_thinking: bool) -> dict:
+    def _create_text_prompt(self, text: str, system_prompt: str, enable_thinking: bool) -> str:
         """
-        Create prompt structure based on input content.
+        Create text-only prompt using tokenizer
 
-        :param input_data: Processed input data (text + images)
-        :param system_prompt: System prompt to prepend
+        :param text: Input text
+        :param system_prompt: System prompt
         :param enable_thinking: Whether to enable thinking mode
-        :return: Dictionary with prompt structure
+        :return: Formatted prompt string
         """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ]
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking
+        )
+
+    def _create_mm_prompt(self, input_data: dict, system_prompt: str) -> Dict[str, Any]:
+        """
+        Create multi-modal prompt using processor
+
+        :param input_data: Processed input data with images and text
+        :param system_prompt: System prompt
+        :return: Dictionary with prompt and multi-modal data
+        """
+        if not self.processor:
+            raise ValueError("Multi-modal processing requires a valid processor")
+
         messages = [{"role": "system", "content": system_prompt}]
 
+        # Build content list with images and text
         content = []
-        # Add images first if they exist
-        if input_data["images"]:
-            for img in input_data["images"]:
-                content.append({
-                    "type": "image",
-                    "image": f"data:image/jpeg;base64,{img}",
-                })
+        for img in input_data["images"]:
+            content.append({
+                "type": "image",
+                "image": f"data:image/jpeg;base64,{img}",
+            })
 
-        # Add text if it exists
         if input_data["text"]:
             content.append({
                 "type": "text",
@@ -112,19 +136,15 @@ class VLLM:
             "content": content
         })
 
-        # Get the text prompt using chat template
-        tokenizer = self.llm.get_tokenizer()
-        text_prompt = tokenizer.apply_chat_template(
+        # Process with processor for multi-modal models
+        text_prompt = self.processor.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking
+            add_generation_prompt=True
         )
 
-        # Prepare multi-modal data if needed
-        mm_data = {}
-        if self.is_multimodal and input_data["images"]:
-            mm_data = {"image": [img["image"] for img in content if img["type"] == "image"]}
+        # Prepare multi-modal inputs
+        mm_data = {"image": [img["image"] for img in content if img["type"] == "image"]}
 
         return {
             "prompt": text_prompt,
@@ -159,26 +179,35 @@ class VLLM:
         # Process all inputs to extract text and images
         processed_inputs = [self._process_input(input_str) for input_str in inputs]
 
-        # Create prompts for all inputs
-        prompts = []
-        for input_data in processed_inputs:
-            prompts.append(self._create_prompt(input_data, system_prompt, enable_thinking))
-
-        # Separate pure text prompts from multi-modal prompts
+        # Separate text-only and multi-modal inputs
         text_prompts = []
         mm_prompts = []
-        for prompt in prompts:
-            if prompt["multi_modal_data"]:
-                mm_prompts.append(prompt)
+
+        for input_data in processed_inputs:
+            if input_data["is_multimodal"]:
+                if not self.is_multimodal:
+                    raise ValueError(
+                        "Multi-modal input detected but model is not initialized with multi-modal support. "
+                        "Please check your model initialization."
+                    )
+                try:
+                    mm_prompts.append(
+                        self._create_mm_prompt(input_data, system_prompt)
+                    )
+                except Exception as e:
+                    print(f"Error creating multi-modal prompt: {e}")
+                    mm_prompts.append(None)
             else:
-                text_prompts.append(prompt["prompt"])
+                text_prompts.append(
+                    self._create_text_prompt(input_data["text"], system_prompt, enable_thinking)
+                )
 
         results = []
 
-        # Process pure text prompts
+        # Process text-only prompts
         if text_prompts:
             text_outputs = self.llm.generate(
-                prompts=text_prompts,
+                prompts=[p for p in text_prompts if p is not None],
                 sampling_params=SamplingParams(
                     temperature=temperature,
                     top_p=top_p,
@@ -186,12 +215,15 @@ class VLLM:
                 ),
                 lora_request=LoRARequest("adapter", 1, lora_path) if lora_path is not None else None
             )
-            results.extend([output.outputs[0].text for output in text_outputs])
+            # Map results back to original order
+            text_results = [output.outputs[0].text if output else "" for output in text_outputs]
+            results.extend(text_results)
 
         # Process multi-modal prompts
         if mm_prompts and self.is_multimodal:
+            valid_mm_prompts = [p for p in mm_prompts if p is not None]
             mm_outputs = self.llm.generate(
-                mm_prompts,
+                valid_mm_prompts,
                 sampling_params=SamplingParams(
                     temperature=temperature,
                     top_p=top_p,
@@ -199,113 +231,8 @@ class VLLM:
                 ),
                 lora_request=LoRARequest("adapter", 1, lora_path) if lora_path is not None else None
             )
-            results.extend([output.outputs[0].text for output in mm_outputs])
+            # Map results back to original order
+            mm_results = [output.outputs[0].text if output else "" for output in mm_outputs]
+            results.extend(mm_results)
 
         return results
-
-# from vllm import LLM, SamplingParams
-# from vllm.lora.request import LoRARequest
-# from typing import Optional, Dict, List
-# import torch
-#
-# class VLLM:
-#     def __init__(
-#         self,
-#         model: str,
-#         max_model_len: int = 10000,
-#         gpu_memory_utilization: float = 0.9,
-#         tensor_parallel_size: int = None,
-#         enable_lora: bool = False
-#     ):
-#         """
-#         Initialize the VLLMGenerator with the specified model and configurations.
-#
-#         :param model: Name of the model to load.
-#         :param max_model_len: Maximum length of the model's context.
-#         :param gpu_memory_utilization: Fraction of GPU memory to utilize.
-#         :param tensor_parallel_size: Number of GPUs to use for tensor parallelism.
-#         :param enable_lora: Whether to enable LoRA support.
-#         """
-#         if tensor_parallel_size is None:
-#             tensor_parallel_size = torch.cuda.device_count()
-#         self.llm = LLM(
-#             model=model,
-#             max_model_len=max_model_len,
-#             gpu_memory_utilization=gpu_memory_utilization,
-#             tensor_parallel_size=tensor_parallel_size,
-#             enable_lora=enable_lora
-#         )
-#
-#     def _create_prompts(self, inputs: List[str], system_prompt: str, enable_thinking: bool = False) -> List[str]:
-#         """
-#         Create chat prompts for each input using the system prompt.
-#
-#         :param inputs: List of input prompts.
-#         :param system_prompt: System prompt to prepend to each input.
-#         :param enable_thinking: Whether to enable thinking mode in the chat template.
-#         :return: List of formatted prompts.
-#         """
-#         tokenizer = self.llm.get_tokenizer()
-#         prompts = []
-#         for data in inputs:
-#             message = [
-#                 {"role": "system", "content": system_prompt},
-#                 {"role": "user", "content": data}
-#             ]
-#             prompt = tokenizer.apply_chat_template(
-#                 message,
-#                 tokenize=False,
-#                 add_generation_prompt=True,
-#                 enable_thinking=enable_thinking
-#             )
-#             prompts.append(prompt)
-#         return prompts
-#
-#     def _generate_initial_responses(self, prompts: List[str], temperature: float, max_tokens: int, top_p: float, lora_path: Optional[str]) -> List[str]:
-#         """
-#         Generate initial responses for the provided prompts.
-#
-#         :param prompts: List of formatted prompts.
-#         :param temperature: Temperature parameter for sampling.
-#         :param max_tokens: Maximum number of tokens to generate.
-#         :param top_p: Top-p parameter for sampling.
-#         :param lora_path: Path to the LoRA adapter (optional).
-#         :return: List of generated response texts.
-#         """
-#         outputs = self.llm.generate(
-#             prompts=prompts,
-#             sampling_params=SamplingParams(
-#                 temperature=temperature,
-#                 top_p=top_p,
-#                 max_tokens=max_tokens
-#             ),
-#             lora_request=LoRARequest("adapter", 1, lora_path) if lora_path is not None else None
-#         )
-#         return [output.outputs[0].text for output in outputs]
-#
-#     def generate(
-#         self,
-#         inputs: List[str],
-#         system_prompt: str = "You are a helpful assistant.",
-#         enable_thinking: bool = False,
-#         temperature: float = 0.8,
-#         max_tokens: int = 10000,
-#         top_p: float = 0.95,
-#         lora_path: Optional[str] = None
-#     ) -> List[str]:
-#         """
-#         Parallelly generate responses for multiple inputs.
-#
-#         :param inputs: List of input prompts.
-#         :param system_prompt: System prompt to prepend to each input.
-#         :param enable_thinking: Whether to enable thinking mode in the chat template.
-#         :param temperature: Temperature parameter for sampling.
-#         :param max_tokens: Maximum number of tokens to generate.
-#         :param top_p: Top-p parameter for sampling.
-#         :param lora_path: Path to the LoRA adapter (optional).
-#         :return: List of generated response texts.
-#         """
-#         prompts = self._create_prompts(inputs, system_prompt, enable_thinking)
-#         results = self._generate_initial_responses(prompts, temperature, max_tokens, top_p, lora_path)
-#
-#         return results
