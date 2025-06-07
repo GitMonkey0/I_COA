@@ -22,7 +22,7 @@ def extract_predicted_label(coa_text):
 
     # 查找第一个出现的类别词
     for category in CLASSES:
-        if category in text_after_reasoning:
+        if category in text_after_reasoning.lower():
             return category
     return None
 
@@ -36,7 +36,7 @@ def main():
     predicted_labels = []
 
     for item in data:
-        true_label = item["label"]
+        true_label = item["safety_label"]
         coa_text = item["pred"]
         pred_label = extract_predicted_label(coa_text)
 
