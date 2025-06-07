@@ -36,7 +36,12 @@ def main():
     predicted_labels = []
 
     for item in data:
-        true_label = item["safety_label"]
+        true_label = item["safety_label"].lower()
+        if "unsafe" in true_label:
+            true_label = "unsafe"
+        else:
+            true_label = "safe"
+
         coa_text = item["pred"]
         pred_label = extract_predicted_label(coa_text)
 
