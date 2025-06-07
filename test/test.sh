@@ -24,11 +24,13 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 # 指定运行顺序
 DIRECTORIES=(
   "baseline"
+  "coa"
 )
 
 # 为每个目录定义运行顺序
 declare -A RUN_ORDER=(
     ["baseline"]="gen_pred.py"
+    ["coa"]="gen_coa.py eval_coa.py"
 )
 
 # 运行所有脚本
