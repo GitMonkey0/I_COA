@@ -42,7 +42,7 @@ def main():
         else:
             true_label = "safe"
 
-        coa_text = item["pred"]
+        coa_text = item["icoa"]
         pred_label = extract_predicted_label(coa_text)
 
         if pred_label is None:
