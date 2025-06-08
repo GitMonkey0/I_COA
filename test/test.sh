@@ -13,7 +13,7 @@ DIRECTORIES=(
 
 # 为每个目录定义运行顺序
 declare -A RUN_ORDER=(
-    ["baseline"]="gen_pred.py"
+    ["baseline"]="gen_pred.py eval_pred.py"
     ["coa"]="gen_coa.py eval_coa.py"
 )
 
